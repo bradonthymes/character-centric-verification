@@ -29,7 +29,10 @@ jobs:
 
       - run: npm ci
 
-      - name: Check the study data still matches the corpus
+      - name: Verify the study set
+        # The corpus is not in the repository, so this checks structure,
+        # playback windows and the recorded hashes. Run the same command with
+        # dataset.jsonl present locally to also re-compare every question.
         run: python3 scripts/select_study_items.py --check
 
       - run: npm run lint

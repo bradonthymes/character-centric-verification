@@ -44,6 +44,7 @@ next-env.d.ts
 # Python bytecode from the build scripts
 __pycache__/
 
-# The full build corpus stays out of the repository; dataset.jsonl (the
-# released subset) is enough to validate the study set.
+# The corpus stays out of this public repository. app/data/study-integrity.json
+# lets the generated study set be validated without it.
 claims.jsonl
+dataset.jsonl

@@ -16,6 +16,7 @@ added later without disturbing the ones already chosen.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from study_config import (
     DATASET,
     DIST_DIR,
     FILMS,
+    INTEGRITY_JSON,
     QUESTIONS_JSON,
     QUESTIONS_PER_FILM,
     category_label,
@@ -103,14 +105,16 @@ def select_for_film(film_id, released, sources):
 
 
 def build():
-    released = load_jsonl(DATASET)
-    if not CLAIMS.exists():
+    # Neither corpus file is committed; both must be copied into the project
+    # root to regenerate. Validation needs neither — see check().
+    missing = [f.name for f in (DATASET, CLAIMS) if not f.exists()]
+    if missing:
         sys.exit(
-            f'{CLAIMS.name} is needed to regenerate the study set (anchor times '
-            'and quality flags) but is not in the repository — copy it into the '
-            'project root first. Validating an existing set needs only '
-            f'{DATASET.name}: run with --check.',
+            f'{" and ".join(missing)} needed to regenerate the study set but not '
+            'in the repository — copy the corpus into the project root first. '
+            'To validate the existing set instead, run with --check.',
         )
+    released = load_jsonl(DATASET)
     sources = {record['example_id']: record for record in load_jsonl(CLAIMS)}
 
     movies = []
@@ -184,8 +188,44 @@ def build():
         'questions': questions,
     }
     QUESTIONS_JSON.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + '\n')
+    write_integrity(payload)
     report(payload, released, sources, shortfalls)
     return payload
+
+
+def digest_of(value) -> str:
+    """Stable hash of a JSON value, independent of key order and spacing."""
+    canonical = json.dumps(value, sort_keys=True, ensure_ascii=False,
+                           separators=(',', ':'))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def file_digest(path) -> str | None:
+    if not path.exists():
+        return None
+    hasher = hashlib.sha256()
+    with path.open('rb') as handle:
+        for block in iter(lambda: handle.read(1 << 20), b''):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def write_integrity(payload) -> None:
+    """Record hashes so the study set can be validated without the corpus.
+
+    Neither corpus file is committed, so CI cannot diff against them. It can
+    still prove the generated file is exactly what the corpus produced, which is
+    what catches a hand-edit or a truncated write.
+    """
+    INTEGRITY_JSON.write_text(json.dumps({
+        'note': 'Written by select_study_items.py. --check verifies these; with '
+                'dataset.jsonl present it also re-compares every question.',
+        'dataset_sha256': file_digest(DATASET),
+        'dataset_records': sum(1 for _ in DATASET.open()),
+        'questions_sha256': digest_of(payload['questions']),
+        'movies_sha256': digest_of(payload['movies']),
+        'question_count': len(payload['questions']),
+    }, indent=2) + '\n')
 
 
 def report(payload, released, sources, shortfalls):
@@ -206,14 +246,14 @@ def report(payload, released, sources, shortfalls):
 
 
 def check(payload=None):
-    """Validate the emitted file against dataset.jsonl.
+    """Validate the generated study set.
 
-    Deliberately needs only dataset.jsonl, so CI can verify the study set
-    without the full build corpus: dataset.jsonl *is* the non-retired set, so a
-    retired question is exactly one that is absent from it.
+    Neither corpus file is committed, so this adapts to what is on hand:
+    structure and playback windows are always checked; the recorded hashes prove
+    the file is untouched since generation; and when dataset.jsonl is present
+    every question, answer and claim is re-compared against it word for word.
     """
     payload = payload or json.loads(QUESTIONS_JSON.read_text())
-    released = {record['example_id']: record for record in load_jsonl(DATASET)}
     movies = {movie['id']: movie for movie in payload['movies']}
     errors = []
     per_film = Counter(q['movieId'] for q in payload['questions'])
@@ -222,12 +262,45 @@ def check(payload=None):
         if per_film[film_id] != QUESTIONS_PER_FILM:
             errors.append(f'{film_id}: {per_film[film_id]} questions, expected {QUESTIONS_PER_FILM}')
 
+    # Hashes: catches a hand-edited or truncated study-questions.json even with
+    # no corpus to compare against.
+    integrity = None
+    if INTEGRITY_JSON.exists():
+        integrity = json.loads(INTEGRITY_JSON.read_text())
+        if digest_of(payload['questions']) != integrity.get('questions_sha256'):
+            errors.append('questions do not match the recorded hash — the file '
+                          'was edited by hand or regenerated without --check')
+        if digest_of(payload['movies']) != integrity.get('movies_sha256'):
+            errors.append('movies do not match the recorded hash')
+    else:
+        errors.append(f'{INTEGRITY_JSON.name} is missing; regenerate the study set')
+
+    released = {}
+    if DATASET.exists():
+        released = {record['example_id']: record for record in load_jsonl(DATASET)}
+        if integrity and integrity.get('dataset_sha256') not in (None, file_digest(DATASET)):
+            errors.append(f'{DATASET.name} differs from the copy the study set '
+                          'was built from — regenerate before trusting it')
+
     seen = set()
     for question in payload['questions']:
         qid = question['id']
         if qid in seen:
             errors.append(f'{qid}: duplicate')
         seen.add(qid)
+
+        window = question['window']
+        anchor = question['anchor']
+        if window['start'] > anchor['start'] + 0.001:
+            errors.append(f'{qid}: playback window starts after the anchored scene')
+        if window['end'] + 0.001 < anchor['end']:
+            errors.append(f'{qid}: playback window ends before the anchored scene')
+        runtime = movies[question['movieId']]['durationSeconds']
+        if runtime and window['end'] > runtime + 0.5:
+            errors.append(f'{qid}: playback window runs past the film runtime')
+
+        if not released:
+            continue
         record = released.get(qid)
         if record is None:
             errors.append(f'{qid}: not in dataset.jsonl (retired or unknown)')
@@ -240,23 +313,16 @@ def check(payload=None):
         expected = [(c['id'], c['claim'], c['role']) for c in record['claims']]
         if emitted != expected:
             errors.append(f'{qid}: claims differ from dataset.jsonl')
-        window = question['window']
-        anchor = question['anchor']
-        if window['start'] > anchor['start'] + 0.001:
-            errors.append(f'{qid}: playback window starts after the anchored scene')
-        if window['end'] + 0.001 < anchor['end']:
-            errors.append(f'{qid}: playback window ends before the anchored scene')
-        runtime = movies[question['movieId']]['durationSeconds']
-        if runtime and window['end'] > runtime + 0.5:
-            errors.append(f'{qid}: playback window runs past the film runtime')
 
     if errors:
         print(f'FAILED: {len(errors)} problem(s)')
         for error in errors[:20]:
             print(f'  - {error}')
         return 1
+    against = (f'all text re-checked against {DATASET.name}' if released
+               else 'hashes match; no corpus present to re-check text against')
     print(f'OK: {len(payload["questions"])} questions, {len(movies)} movies, '
-          'all text matches dataset.jsonl and every playback window covers its anchored scene')
+          f'every playback window covers its anchored scene, {against}')
     return 0
 
 

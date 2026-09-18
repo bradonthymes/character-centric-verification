@@ -11,6 +11,9 @@ REPO = Path(__file__).resolve().parent.parent
 DATASET = REPO / 'dataset.jsonl'
 CLAIMS = REPO / 'claims.jsonl'
 QUESTIONS_JSON = REPO / 'app' / 'data' / 'study-questions.json'
+# Hashes of the generated study set, so it can be validated in CI where neither
+# corpus file is present.
+INTEGRITY_JSON = REPO / 'app' / 'data' / 'study-integrity.json'
 MEDIA = REPO / 'public' / 'media'
 
 QUESTIONS_PER_FILM = 10

@@ -12,7 +12,9 @@ python3 scripts/build_distribution.py           # the films participants attach
 
 ## Sources
 
-Both corpus files sit in the repository root:
+**Neither corpus file is committed** — this repository is public, and the corpus
+is unpublished. Copy both into the project root to regenerate; the scripts exit
+with an explanation if they are absent.
 
 - `dataset.jsonl` — 6,327 released records, the non-retired subset of the build,
   trimmed to entailed claims. **Every piece of reviewer-facing text comes from
@@ -22,9 +24,19 @@ Both corpus files sit in the repository root:
   does not carry — it stores the scene id alone — and the quality flags
   (`prose_stale`, `thin_core`, `n_core`) used to rank candidates.
 
-`select_study_items.py --check` re-reads the generated file and fails if any
-question, answer or claim differs from `dataset.jsonl`, if any id is retired or
-absent, or if a playback window does not cover its anchored scene.
+## Validation
+
+`select_study_items.py --check` adapts to what is present, so CI can verify the
+study set without the corpus:
+
+| Always | Structure (150 questions, 10 per film, no duplicates) and that every playback window covers its anchored scene |
+| --- | --- |
+| Always | The SHA-256 hashes in `study-integrity.json`, which catch a hand-edited or truncated `study-questions.json` |
+| With `dataset.jsonl` present | Re-compares every question, answer and claim word for word, and flags any id that is retired or unknown |
+
+`study-integrity.json` is written alongside the study set and records the hash of
+the corpus it was built from, so a `dataset.jsonl` that has moved on since is
+reported rather than silently trusted.
 
 ## Selection
 
