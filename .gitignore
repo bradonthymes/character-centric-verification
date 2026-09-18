@@ -48,3 +48,6 @@ __pycache__/
 # lets the generated study set be validated without it.
 claims.jsonl
 dataset.jsonl
+
+# TypeScript incremental build cache
+tsconfig.tsbuildinfo
