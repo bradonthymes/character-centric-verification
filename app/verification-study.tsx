@@ -16,6 +16,7 @@ import {
   Download,
   FileQuestion,
   Flag,
+  FolderOpen,
   Info,
   ListChecks,
   MessageSquareText,
@@ -25,7 +26,6 @@ import {
   Search,
   SkipBack,
   SkipForward,
-  Users,
 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
@@ -56,6 +56,17 @@ import {
   studyQuestions,
   type StudyQuestion,
 } from './data/study-data';
+import {
+  type FolderFiles,
+  folderPermission,
+  forgetFolderHandle,
+  loadFolderHandle,
+  pickFolder,
+  readFileList,
+  readFolderHandle,
+  saveFolderHandle,
+  supportsDirectoryPicker,
+} from './media-folder';
 
 type QuestionForm = {
   clarity: string;
@@ -127,7 +138,46 @@ declare global {
 }
 
 const STORAGE_KEY = 'videoqa-verification-v1';
-const PARTICIPANT_ID = 'P001';
+const PARTICIPANT_KEY = 'videoqa-verification-participant-v1';
+const FINAL_SUBMISSION_KEY = 'videoqa-study-final-submission';
+
+// Poster paths in the data are root-absolute. Next rewrites its own asset URLs
+// for a GitHub Pages project site, but not strings we hand to <img>.
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
+const asset = (path: string) => `${BASE_PATH}${path}`;
+
+// How many completed questions between off-browser backup nudges.
+const BACKUP_PROMPT_EVERY = 25;
+
+// Participant ids are assigned, not typed, so two reviewers cannot collide on
+// the same label. The alphabet drops I, L, O, U, 0 and 1 so an id that gets
+// read aloud or copied by hand cannot come back wrong.
+const ID_ALPHABET = '23456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+function makeParticipantId() {
+  const chars: string[] = [];
+  const buffer = new Uint8Array(16);
+  // 240 is the largest multiple of the alphabet under 256; discarding the rest
+  // keeps every character equally likely.
+  const limit = ID_ALPHABET.length * Math.floor(256 / ID_ALPHABET.length);
+  while (chars.length < 8) {
+    crypto.getRandomValues(buffer);
+    for (const byte of buffer) {
+      if (byte < limit && chars.length < 8)
+        chars.push(ID_ALPHABET[byte % ID_ALPHABET.length]);
+    }
+  }
+  return `P-${chars.slice(0, 4).join('')}-${chars.slice(4).join('')}`;
+}
+
+function writeStorage(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const emptyQuestionForm = (): QuestionForm => ({
   clarity: '',
@@ -163,7 +213,7 @@ const emptyClaimForm = (): ClaimForm => ({
 
 function makeAnnotation(question: StudyQuestion): Annotation {
   return {
-    participant_id: PARTICIPANT_ID,
+    participant_id: '',
     movie_id: question.movieId,
     question_id: question.id,
     question_verification: emptyQuestionForm(),
@@ -184,6 +234,97 @@ const defaultAnnotations = () =>
     studyQuestions.map((question) => [question.id, makeAnnotation(question)]),
   );
 
+const annotationStatuses = ['not_started', 'in_progress', 'complete'] as const;
+
+// Drafts are restored across dataset revisions, so a stored annotation is
+// rebuilt field by field onto a fresh record: unknown keys and claims that no
+// longer exist are dropped, and claims added since the draft was written get
+// empty forms instead of undefined ones.
+function mergeStringForm<T extends Record<string, string>>(
+  base: T,
+  stored: unknown,
+): T {
+  if (!stored || typeof stored !== 'object') return base;
+  const source = stored as Record<string, unknown>;
+  return Object.fromEntries(
+    Object.entries(base).map(([key, fallback]) => [
+      key,
+      typeof source[key] === 'string' ? source[key] : fallback,
+    ]),
+  ) as T;
+}
+
+function mergeAnnotation(
+  base: Annotation,
+  stored: unknown,
+  question: StudyQuestion,
+): Annotation {
+  if (!stored || typeof stored !== 'object') return base;
+  const source = stored as Record<string, unknown>;
+  const storedQuestion = mergeStringForm(
+    { ...base.question_verification, issues: '' },
+    source.question_verification,
+  );
+  const storedIssues = (
+    source.question_verification as { issues?: unknown } | undefined
+  )?.issues;
+  const claims = source.claim_verification as
+    | Record<string, unknown>
+    | undefined;
+  return {
+    ...base,
+    question_verification: {
+      ...base.question_verification,
+      ...storedQuestion,
+      issues: Array.isArray(storedIssues)
+        ? storedIssues.filter(
+            (issue): issue is string => typeof issue === 'string',
+          )
+        : base.question_verification.issues,
+    },
+    answer_verification: mergeStringForm(
+      base.answer_verification,
+      source.answer_verification,
+    ),
+    claim_verification: Object.fromEntries(
+      question.claims.map((claim) => [
+        claim.id,
+        mergeStringForm(emptyClaimForm(), claims?.[claim.id]),
+      ]),
+    ),
+    status: annotationStatuses.includes(source.status as Annotation['status'])
+      ? (source.status as Annotation['status'])
+      : base.status,
+    flagged: source.flagged === true,
+    started_at:
+      typeof source.started_at === 'string'
+        ? source.started_at
+        : base.started_at,
+    completed_at:
+      typeof source.completed_at === 'string'
+        ? source.completed_at
+        : base.completed_at,
+    time_spent_seconds:
+      typeof source.time_spent_seconds === 'number'
+        ? source.time_spent_seconds
+        : base.time_spent_seconds,
+  };
+}
+
+function normalizeAnnotations(stored: unknown): AnnotationMap {
+  const restored = defaultAnnotations();
+  if (!stored || typeof stored !== 'object') return restored;
+  const source = stored as Record<string, unknown>;
+  for (const question of studyQuestions) {
+    restored[question.id] = mergeAnnotation(
+      restored[question.id],
+      source[question.id],
+      question,
+    );
+  }
+  return restored;
+}
+
 function formatTimestamp(seconds: number) {
   const rounded = Math.max(0, Math.floor(seconds));
   const hours = Math.floor(rounded / 3600);
@@ -192,6 +333,13 @@ function formatTimestamp(seconds: number) {
   return [hours, minutes, secs]
     .map((part) => String(part).padStart(2, '0'))
     .join(':');
+}
+
+function fileSafeId(participantId: string) {
+  return (
+    participantId.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-|-$/g, '') ||
+    'participant'
+  );
 }
 
 function touched(annotation: Annotation) {
@@ -283,13 +431,6 @@ const questionIssueOptions = [
   ['no_issues', 'No issues'],
 ];
 
-const fullMovieSources: Record<string, string> = {
-  'american-fiction-2023': '/media/full/american_fiction.mp4',
-  'challengers-2024': '/media/full/challengers.mp4',
-  'fair-play-2023': '/media/full/fair_play.mp4',
-  'poker-face-101-dead-mans-hand-2023': '/media/full/poker_face_s01e01.mp4',
-};
-
 function RadioQuestion({
   label,
   prompt,
@@ -334,6 +475,55 @@ function RadioQuestion({
   );
 }
 
+function ParticipantGate({
+  participantId,
+  onStart,
+}: {
+  participantId: string;
+  onStart: () => void;
+}) {
+  const startRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    startRef.current?.focus();
+  }, []);
+
+  return (
+    <main className="gate-shell">
+      <section className="gate-card">
+        <div className="brand-mark">VQ</div>
+        <p className="eyebrow">Research study</p>
+        <h1>VideoQA Dataset Verification</h1>
+        <p className="gate-copy">
+          You will review {studyQuestions.length} questions, their reference
+          answers, and the atomic claims behind them, against clips from{' '}
+          {movies.length} titles. Expect to work across several sittings.
+        </p>
+        <div className="gate-field">
+          <span id="participant-id-label">Your participant ID</span>
+          <output
+            className="assigned-id"
+            aria-labelledby="participant-id-label"
+          >
+            {participantId}
+          </output>
+          <small>
+            Assigned automatically. It labels your responses and names the file
+            you download at the end, so there is nothing to write down.
+          </small>
+        </div>
+        <Button ref={startRef} className="gate-start" onClick={onStart}>
+          Start verification <ArrowRight />
+        </Button>
+        <p className="gate-note">
+          Nothing is uploaded. Your work is kept in this browser as you go, and
+          at the end you download a single file to send to the research team.
+        </p>
+      </section>
+    </main>
+  );
+}
+
 export default function VerificationStudy() {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [annotations, setAnnotations] =
@@ -348,6 +538,19 @@ export default function VerificationStudy() {
   const [reviewOpen, setReviewOpen] = useState(false);
   const [finalConfirmed, setFinalConfirmed] = useState(false);
   const [studySubmitted, setStudySubmitted] = useState(false);
+  const [responsesDownloaded, setResponsesDownloaded] = useState(false);
+  const [participantId, setParticipantId] = useState('');
+  const [assignedId, setAssignedId] = useState('');
+  const [pendingSeek, setPendingSeek] = useState<number | null>(null);
+  const [mediaFiles, setMediaFiles] = useState<FolderFiles>(() => new Map());
+  const [folderState, setFolderState] = useState<
+    'checking' | 'none' | 'reconnect' | 'ready'
+  >('checking');
+  const [movieUrl, setMovieUrl] = useState('');
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
+  const [backupPromptAt, setBackupPromptAt] = useState(0);
+  const [exitOpen, setExitOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const currentIndexRef = useRef(currentIndex);
@@ -356,17 +559,106 @@ export default function VerificationStudy() {
   const question = studyQuestions[currentIndex];
   const movie = movieById[question.movieId];
   const annotation = annotations[question.id];
+  const movieFile = mediaFiles.get(movie.file);
+  const foundFilms = movies.filter((item) => mediaFiles.has(item.file));
+  const missingFilms = movies.filter((item) => !mediaFiles.has(item.file));
 
   useEffect(() => {
     try {
+      const storedParticipant = localStorage.getItem(PARTICIPANT_KEY);
+      // A returning reviewer keeps the id they were assigned; a new one is
+      // offered a fresh id, which is only persisted once they start.
+      if (storedParticipant) setParticipantId(storedParticipant);
+      else setAssignedId(makeParticipantId());
       const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored)
-        setAnnotations({ ...defaultAnnotations(), ...JSON.parse(stored) });
+      if (stored) setAnnotations(normalizeAnnotations(JSON.parse(stored)));
+      // A reviewer who closed the page before downloading comes back to the
+      // download step rather than to a finished study with no file.
+      if (localStorage.getItem(FINAL_SUBMISSION_KEY)) {
+        setStudySubmitted(true);
+        setReviewOpen(true);
+      }
     } catch {
       setSaveLabel('Local draft could not be restored');
     }
     setMounted(true);
   }, []);
+
+  // A folder chosen through the directory picker can be remembered; restoring
+  // it needs no gesture when permission survived, and one click when it did not.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const handle = await loadFolderHandle();
+      if (!handle) {
+        if (!cancelled) setFolderState('none');
+        return;
+      }
+      const permission = await folderPermission(handle);
+      if (cancelled) return;
+      if (permission !== 'granted') {
+        setFolderState('reconnect');
+        return;
+      }
+      const files = await readFolderHandle(handle);
+      if (cancelled) return;
+      setMediaFiles(files);
+      setFolderState(files.size ? 'ready' : 'none');
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // One object URL per film, released as soon as another film is opened.
+  useEffect(() => {
+    if (!movieFile) {
+      setMovieUrl('');
+      return;
+    }
+    const url = URL.createObjectURL(movieFile);
+    setMovieUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [movieFile]);
+
+  const attachFolder = useCallback(async () => {
+    if (supportsDirectoryPicker()) {
+      const handle = await pickFolder();
+      if (!handle) return;
+      if ((await folderPermission(handle, true)) !== 'granted') return;
+      const files = await readFolderHandle(handle);
+      setMediaFiles(files);
+      setFolderState(files.size ? 'ready' : 'none');
+      await saveFolderHandle(handle);
+      return;
+    }
+    // Safari and Firefox cannot persist a handle, so they re-pick each session.
+    folderInputRef.current?.click();
+  }, []);
+
+  const reconnectFolder = useCallback(async () => {
+    const handle = await loadFolderHandle();
+    if (!handle) {
+      setFolderState('none');
+      return;
+    }
+    if ((await folderPermission(handle, true)) !== 'granted') return;
+    const files = await readFolderHandle(handle);
+    setMediaFiles(files);
+    setFolderState(files.size ? 'ready' : 'none');
+  }, []);
+
+  const detachFolder = useCallback(async () => {
+    await forgetFolderHandle();
+    setMediaFiles(new Map());
+    setFolderState('none');
+  }, []);
+
+  const startStudy = useCallback(() => {
+    const id = assignedId || makeParticipantId();
+    setParticipantId(id);
+    writeStorage(PARTICIPANT_KEY, id);
+  }, [assignedId]);
 
   useEffect(() => {
     currentIndexRef.current = currentIndex;
@@ -470,6 +762,7 @@ export default function VerificationStudy() {
     setCurrentIndex(Math.max(0, Math.min(studyQuestions.length - 1, index)));
     setActiveTab('question');
     setVideoMode('evidence');
+    setPendingSeek(null);
     setCurrentTime(0);
     setTranscriptQuery('');
     setErrors([]);
@@ -506,9 +799,11 @@ export default function VerificationStudy() {
       };
       annotationsRef.current = nextAnnotations;
       setAnnotations(nextAnnotations);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(nextAnnotations));
-      setDirty(false);
-      setSaveLabel('Question complete · saved');
+      const stored = writeStorage(STORAGE_KEY, JSON.stringify(nextAnnotations));
+      setDirty(!stored);
+      setSaveLabel(
+        stored ? 'Question complete · saved' : 'Draft could not be saved',
+      );
       setErrors([]);
       if (!fromTool) {
         if (index < studyQuestions.length - 1) goToQuestion(index + 1);
@@ -600,17 +895,26 @@ export default function VerificationStudy() {
         ),
       );
   };
+  // The whole film is attached, so evidence is a bounded seek into it rather
+  // than a separate file: play the anchored scene, stop at its end.
+  const seekTo = (seconds: number, play = true) => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.readyState === 0) {
+      setPendingSeek(Math.max(0, seconds));
+      return;
+    }
+    video.currentTime = Math.max(0, Math.min(movie.durationSeconds, seconds));
+    if (play) void video.play();
+  };
   const openEvidence = () => {
     setVideoMode('evidence');
-    window.setTimeout(() => void videoRef.current?.play(), 80);
+    seekTo(question.window.start);
   };
+  const browseWholeFilm = () => setVideoMode('full');
   const jumpToAnchor = () => {
-    if (videoRef.current)
-      videoRef.current.currentTime =
-        videoMode === 'evidence'
-          ? Math.max(0, question.anchor.start - question.clip.sourceStart)
-          : question.anchor.start;
-    void videoRef.current?.play();
+    setVideoMode('evidence');
+    seekTo(question.anchor.start);
   };
 
   const completedCount = Object.values(annotations).filter(
@@ -633,13 +937,20 @@ export default function VerificationStudy() {
       ).length,
     0,
   );
-  const unansweredCount = studyQuestions.reduce(
-    (sum, item) => sum + validationErrors(annotations[item.id], item).length,
-    0,
+  // 150 questions with a dozen required fields each: too much to re-derive on
+  // every keystroke.
+  const unansweredCount = useMemo(
+    () =>
+      studyQuestions.reduce(
+        (sum, item) =>
+          sum + validationErrors(annotations[item.id], item).length,
+        0,
+      ),
+    [annotations],
   );
   const progress = Math.round((completedCount / studyQuestions.length) * 100);
-  const sourceOffset = videoMode === 'evidence' ? question.clip.sourceStart : 0;
-  const displayTime = sourceOffset + currentTime;
+  // currentTime is now absolute film time, so it can be shown as-is.
+  const displayTime = currentTime;
 
   const groupedQuestions = useMemo(
     () =>
@@ -651,47 +962,122 @@ export default function VerificationStudy() {
       })),
     [],
   );
+  const completedByMovie = useMemo(
+    () =>
+      Object.fromEntries(
+        groupedQuestions.map(({ movie: item, questions: items }) => [
+          item.id,
+          items.filter(
+            ({ entry }) => annotations[entry.id]?.status === 'complete',
+          ).length,
+        ]),
+      ),
+    [annotations, groupedQuestions],
+  );
+  const movieQuestions = groupedQuestions.find(
+    (group) => group.movie.id === question.movieId,
+  );
+  const positionInMovie =
+    (movieQuestions?.questions.findIndex(
+      ({ index }) => index === currentIndex,
+    ) ?? 0) + 1;
+  const groupOpen = (movieId: string) =>
+    openGroups[movieId] ?? movieId === question.movieId;
+  const toggleGroup = (movieId: string) =>
+    setOpenGroups((current) => ({
+      ...current,
+      [movieId]: !(current[movieId] ?? movieId === question.movieId),
+    }));
   const forceSave = () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(annotations));
-    setDirty(false);
-    setSaveLabel('Draft saved just now');
+    const stored = writeStorage(STORAGE_KEY, JSON.stringify(annotations));
+    setDirty(!stored);
+    setSaveLabel(stored ? 'Draft saved just now' : 'Draft could not be saved');
+    return stored;
   };
+  const saveAndExit = () => {
+    forceSave();
+    setExitOpen(true);
+  };
+  // A study this long runs over many sittings, and the draft lives only in
+  // this browser, so nudge for an off-browser copy as the work piles up.
+  const backupDue =
+    completedCount >= BACKUP_PROMPT_EVERY &&
+    completedCount % BACKUP_PROMPT_EVERY === 0 &&
+    backupPromptAt < completedCount &&
+    completedCount < studyQuestions.length;
   const toggleFlag = () =>
     updateAnnotation(question.id, (current) => ({
       ...current,
       flagged: !current.flagged,
     }));
 
-  const exportJson = () => {
-    const payload = {
-      participant_id: PARTICIPANT_ID,
-      exported_at: new Date().toISOString(),
-      annotations: Object.values(annotations),
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+  const buildPayload = (kind: 'draft' | 'final') => ({
+    participant_id: participantId,
+    study: 'videoqa-dataset-verification',
+    export_kind: kind,
+    exported_at: new Date().toISOString(),
+    questions_total: studyQuestions.length,
+    questions_complete: completedCount,
+    unanswered_required_fields: unansweredCount,
+    // Which films the reviewer actually had while judging, so an odd result can
+    // be traced to missing or wrong media later.
+    media_folder: {
+      attached: folderState === 'ready',
+      films_found: foundFilms.length,
+      films_expected: movies.length,
+      missing: missingFilms.map((item) => item.file),
+      files: Object.fromEntries(
+        foundFilms.map((item) => [
+          item.file,
+          {
+            bytes: mediaFiles.get(item.file)?.size ?? 0,
+            expected_runtime_seconds: item.durationSeconds,
+          },
+        ]),
+      ),
+    },
+    annotations: studyQuestions.map((item) => ({
+      ...annotations[item.id],
+      participant_id: participantId,
+    })),
+  });
+
+  // The downloaded file is the only copy the research team receives, so the
+  // anchor is attached to the document and the blob URL outlives the click.
+  const downloadPayload = (kind: 'draft' | 'final') => {
+    const blob = new Blob([JSON.stringify(buildPayload(kind), null, 2)], {
       type: 'application/json',
     });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `videoqa-verification-${PARTICIPANT_ID}.json`;
+    link.download = `videoqa-verification-${fileSafeId(participantId)}${
+      kind === 'draft' ? '-draft' : ''
+    }-${new Date().toISOString().slice(0, 10)}.json`;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
     link.click();
-    URL.revokeObjectURL(url);
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+    if (kind === 'final') setResponsesDownloaded(true);
   };
 
   const finalSubmit = () => {
     if (!finalConfirmed || unansweredCount > 0) return;
-    const payload = {
-      participant_id: PARTICIPANT_ID,
-      submitted_at: new Date().toISOString(),
-      annotations: Object.values(annotations),
-    };
-    localStorage.setItem(
-      'videoqa-study-final-submission',
-      JSON.stringify(payload),
-    );
+    writeStorage(FINAL_SUBMISSION_KEY, JSON.stringify(buildPayload('final')));
     setStudySubmitted(true);
   };
+
+  // The stored participant ID is only readable after mount, so the first paint
+  // matches the server and the gate never flashes for a returning reviewer.
+  if (!mounted)
+    return (
+      <main className="gate-shell" aria-busy="true">
+        <p className="gate-boot">Loading study…</p>
+      </main>
+    );
+  if (!participantId)
+    return <ParticipantGate participantId={assignedId} onStart={startStudy} />;
 
   return (
     <TooltipProvider>
@@ -712,19 +1098,21 @@ export default function VerificationStudy() {
           </Button>
           <div className="participant-chip">
             <span>Participant</span>
-            <strong>{PARTICIPANT_ID}</strong>
+            <strong>{participantId}</strong>
           </div>
         </header>
 
         <div className="study-grid">
           <aside className="nav-panel">
             <div className="movie-summary">
-              <img src={movie.poster} alt={`${movie.title} poster`} />
+              <img src={asset(movie.poster)} alt={`${movie.title} poster`} />
               <div>
                 <p className="eyebrow">Current title</p>
                 <h2>{movie.title}</h2>
                 <p>
-                  Question {currentIndex + 1} of {studyQuestions.length}
+                  Question {positionInMovie} of{' '}
+                  {movieQuestions?.questions.length} here · {currentIndex + 1}{' '}
+                  of {studyQuestions.length} overall
                 </p>
               </div>
             </div>
@@ -733,53 +1121,79 @@ export default function VerificationStudy() {
               aria-label={`Study is ${progress} percent complete`}
             />
             <div className="progress-copy">
-              <span>Overall progress</span>
+              <span>
+                {completedCount} of {studyQuestions.length} complete
+              </span>
               <strong>{progress}%</strong>
             </div>
             <nav aria-label="Assigned questions" className="question-list">
               {groupedQuestions.map(
                 ({ movie: listMovie, questions: listQuestions }) => (
                   <div className="question-group" key={listMovie.id}>
-                    <p className="eyebrow">{listMovie.title}</p>
-                    {listQuestions.map(({ entry, index }) => {
-                      const itemAnnotation = annotations[entry.id];
-                      const status = itemAnnotation.flagged
-                        ? 'Flagged'
-                        : itemAnnotation.status === 'complete'
-                          ? 'Complete'
-                          : itemAnnotation.status === 'in_progress'
-                            ? 'In progress'
-                            : 'Not started';
-                      return (
-                        <button
-                          className={
-                            index === currentIndex
-                              ? 'question-row active'
-                              : 'question-row'
-                          }
-                          key={entry.id}
-                          onClick={() => goToQuestion(index)}
-                          aria-current={
-                            index === currentIndex ? 'step' : undefined
-                          }
-                        >
-                          <span>{String(index + 1).padStart(2, '0')}</span>
-                          <div>
-                            <strong>{entry.question}</strong>
-                            <small>{status}</small>
-                          </div>
-                          {itemAnnotation.flagged ? (
-                            <Flag className="flag-status" />
-                          ) : itemAnnotation.status === 'complete' ? (
-                            <CheckCircle2 className="complete-status" />
-                          ) : itemAnnotation.status === 'in_progress' ? (
-                            <Clock3 />
-                          ) : (
-                            <Circle className="not-started-status" />
-                          )}
-                        </button>
-                      );
-                    })}
+                    <button
+                      className="group-toggle"
+                      onClick={() => toggleGroup(listMovie.id)}
+                      aria-expanded={groupOpen(listMovie.id)}
+                    >
+                      <ChevronRight
+                        className={
+                          groupOpen(listMovie.id)
+                            ? 'group-caret open'
+                            : 'group-caret'
+                        }
+                      />
+                      <span className="eyebrow">{listMovie.title}</span>
+                      <small
+                        className={
+                          completedByMovie[listMovie.id] ===
+                          listQuestions.length
+                            ? 'group-count done'
+                            : 'group-count'
+                        }
+                      >
+                        {completedByMovie[listMovie.id]}/{listQuestions.length}
+                      </small>
+                    </button>
+                    {groupOpen(listMovie.id) &&
+                      listQuestions.map(({ entry, index }) => {
+                        const itemAnnotation = annotations[entry.id];
+                        const status = itemAnnotation.flagged
+                          ? 'Flagged'
+                          : itemAnnotation.status === 'complete'
+                            ? 'Complete'
+                            : itemAnnotation.status === 'in_progress'
+                              ? 'In progress'
+                              : 'Not started';
+                        return (
+                          <button
+                            className={
+                              index === currentIndex
+                                ? 'question-row active'
+                                : 'question-row'
+                            }
+                            key={entry.id}
+                            onClick={() => goToQuestion(index)}
+                            aria-current={
+                              index === currentIndex ? 'step' : undefined
+                            }
+                          >
+                            <span>{String(index + 1).padStart(2, '0')}</span>
+                            <div>
+                              <strong>{entry.question}</strong>
+                              <small>{status}</small>
+                            </div>
+                            {itemAnnotation.flagged ? (
+                              <Flag className="flag-status" />
+                            ) : itemAnnotation.status === 'complete' ? (
+                              <CheckCircle2 className="complete-status" />
+                            ) : itemAnnotation.status === 'in_progress' ? (
+                              <Clock3 />
+                            ) : (
+                              <Circle className="not-started-status" />
+                            )}
+                          </button>
+                        );
+                      })}
                   </div>
                 ),
               )}
@@ -787,7 +1201,7 @@ export default function VerificationStudy() {
             <Button
               variant="outline"
               className="mt-auto w-full"
-              onClick={forceSave}
+              onClick={saveAndExit}
             >
               <Save /> Save and exit
             </Button>
@@ -798,8 +1212,8 @@ export default function VerificationStudy() {
               <div>
                 <span className="mode-dot" />
                 {videoMode === 'evidence'
-                  ? 'Evidence clip'
-                  : 'Full movie proxy'}
+                  ? `Anchored scene · ${formatTimestamp(question.window.start)}–${formatTimestamp(question.window.end)}`
+                  : 'Browsing the whole film'}
               </div>
               <span>
                 {formatTimestamp(displayTime)} /{' '}
@@ -807,23 +1221,66 @@ export default function VerificationStudy() {
               </span>
             </div>
             <div className="video-stage functional-video">
-              <video
-                key={`${question.id}-${videoMode}`}
-                ref={videoRef}
-                src={
-                  videoMode === 'evidence'
-                    ? question.clip.url
-                    : fullMovieSources[question.movieId]
-                }
-                poster={movie.poster}
-                controls
-                preload="metadata"
-                onTimeUpdate={(event) =>
-                  setCurrentTime(event.currentTarget.currentTime)
-                }
-              >
-                Your browser does not support HTML video.
-              </video>
+              {movieUrl ? (
+                <video
+                  key={movie.id}
+                  ref={videoRef}
+                  src={movieUrl}
+                  poster={asset(movie.poster)}
+                  controls
+                  preload="metadata"
+                  onLoadedMetadata={(event) => {
+                    const video = event.currentTarget;
+                    const target = pendingSeek ?? question.window.start;
+                    setPendingSeek(null);
+                    video.currentTime = Math.max(0, target);
+                  }}
+                  onTimeUpdate={(event) => {
+                    const video = event.currentTarget;
+                    setCurrentTime(video.currentTime);
+                    // Evidence playback stops at the end of the anchored scene;
+                    // browsing the film is unbounded.
+                    if (
+                      videoMode === 'evidence' &&
+                      video.currentTime >= question.window.end
+                    ) {
+                      video.pause();
+                      video.currentTime = question.window.end;
+                    }
+                  }}
+                >
+                  Your browser does not support HTML video.
+                </video>
+              ) : (
+                <div className="video-placeholder">
+                  <img src={asset(movie.poster)} alt="" />
+                  <div>
+                    <FolderOpen />
+                    <strong>
+                      {folderState === 'ready'
+                        ? `${movie.file} is not in the attached folder`
+                        : 'Attach your study media folder to watch the film'}
+                    </strong>
+                    <p>
+                      The video stays on your computer — nothing is uploaded and
+                      nothing is downloaded from this site.
+                    </p>
+                    <Button
+                      size="sm"
+                      onClick={
+                        folderState === 'reconnect'
+                          ? reconnectFolder
+                          : attachFolder
+                      }
+                    >
+                      <FolderOpen />
+                      {folderState === 'reconnect'
+                        ? 'Reconnect folder'
+                        : 'Choose folder'}
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="media-actions">
               <Button
@@ -835,9 +1292,9 @@ export default function VerificationStudy() {
                 <SkipBack />
                 10 sec
               </Button>
-              <Button size="sm" onClick={openEvidence}>
+              <Button size="sm" onClick={openEvidence} disabled={!movieUrl}>
                 <Play />
-                Open evidence · {formatTimestamp(question.anchor.start)}–
+                Play anchored scene · {formatTimestamp(question.anchor.start)}–
                 {formatTimestamp(question.anchor.end)}
               </Button>
               <Button
@@ -850,32 +1307,71 @@ export default function VerificationStudy() {
                 <SkipForward />
               </Button>
               <Button
-                variant="ghost"
+                variant={videoMode === 'full' ? 'secondary' : 'ghost'}
                 size="sm"
-                onClick={() => setVideoMode('full')}
-                disabled={videoMode === 'full'}
+                onClick={browseWholeFilm}
+                disabled={!movieUrl || videoMode === 'full'}
               >
                 <RotateCcw />
-                Return to full movie
+                Browse whole film
               </Button>
             </div>
 
+            <output className="folder-status">
+              <FolderOpen />
+              {folderState === 'ready' ? (
+                <span>
+                  Media folder attached · {foundFilms.length} of {movies.length}{' '}
+                  films found
+                  {missingFilms.length > 0 &&
+                    ` · missing ${missingFilms.map((item) => item.title).join(', ')}`}
+                </span>
+              ) : folderState === 'reconnect' ? (
+                <span>
+                  Your media folder needs reconnecting for this session.
+                </span>
+              ) : (
+                <span>
+                  No media folder attached. The films stay on your computer;
+                  this site never uploads or downloads them.
+                </span>
+              )}
+              <Button
+                variant="outline"
+                size="xs"
+                onClick={
+                  folderState === 'reconnect' ? reconnectFolder : attachFolder
+                }
+              >
+                {folderState === 'ready'
+                  ? 'Change folder'
+                  : folderState === 'reconnect'
+                    ? 'Reconnect'
+                    : 'Choose folder'}
+              </Button>
+              {folderState === 'ready' && (
+                <Button variant="ghost" size="xs" onClick={detachFolder}>
+                  Forget
+                </Button>
+              )}
+              {/* Safari and Firefox fall back to this; it cannot be persisted. */}
+              <input
+                ref={folderInputRef}
+                type="file"
+                accept="video/*"
+                multiple
+                hidden
+                // @ts-expect-error -- webkitdirectory is not in React's typings
+                webkitdirectory=""
+                onChange={(event) => {
+                  const files = readFileList(event.target.files);
+                  setMediaFiles(files);
+                  setFolderState(files.size ? 'ready' : 'none');
+                }}
+              />
+            </output>
+
             <div className="resource-grid">
-              <section className="resource-card">
-                <div className="resource-title">
-                  <Users />
-                  <span>Character bank</span>
-                  <Badge variant="secondary">{movie.characters.length}</Badge>
-                </div>
-                <div className="character-strip">
-                  {movie.characters.map((character) => (
-                    <div className="character" key={character.id}>
-                      <img src={character.image} alt={character.name} />
-                      <span>{character.name}</span>
-                    </div>
-                  ))}
-                </div>
-              </section>
               <section className="resource-card transcript-card">
                 <div className="resource-title">
                   <MessageSquareText />
@@ -1321,14 +1817,16 @@ export default function VerificationStudy() {
                             variant="outline"
                             size="xs"
                             onClick={openEvidence}
+                            disabled={!movieUrl}
                           >
                             <Play />
-                            Play clip
+                            Play scene
                           </Button>
                           <Button
                             variant="ghost"
                             size="xs"
                             onClick={jumpToAnchor}
+                            disabled={!movieUrl}
                           >
                             Jump to time
                           </Button>
@@ -1437,6 +1935,31 @@ export default function VerificationStudy() {
               </TabsContent>
             </Tabs>
             <div className="submission-bar">
+              {backupDue && (
+                <output className="backup-prompt">
+                  <Download />
+                  <span>
+                    {completedCount} questions done. Keep a copy off this
+                    browser.
+                  </span>
+                  <Button
+                    size="xs"
+                    onClick={() => {
+                      downloadPayload('draft');
+                      setBackupPromptAt(completedCount);
+                    }}
+                  >
+                    Download
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    onClick={() => setBackupPromptAt(completedCount)}
+                  >
+                    Later
+                  </Button>
+                </output>
+              )}
               <div className="save-state">
                 {dirty ? <Clock3 /> : <CheckCircle2 />}
                 <span>{saveLabel}</span>
@@ -1472,26 +1995,79 @@ export default function VerificationStudy() {
         </div>
       </main>
 
+      <Dialog open={exitOpen} onOpenChange={setExitOpen}>
+        <DialogContent className="exit-dialog">
+          <DialogHeader>
+            <p className="eyebrow">Progress saved</p>
+            <DialogTitle>
+              {completedCount} of {studyQuestions.length} questions complete
+            </DialogTitle>
+            <DialogDescription>
+              Your work is saved in this browser, on this device. Reopen this
+              page on the same browser to pick up where you left off — clearing
+              site data or switching machines loses the draft, so keep a copy.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="exit-movie-list">
+            {groupedQuestions.map(({ movie: listMovie, questions: items }) => (
+              <div key={listMovie.id}>
+                <span>{listMovie.title}</span>
+                <strong
+                  className={
+                    completedByMovie[listMovie.id] === items.length
+                      ? 'group-count done'
+                      : 'group-count'
+                  }
+                >
+                  {completedByMovie[listMovie.id]}/{items.length}
+                </strong>
+              </div>
+            ))}
+          </div>
+          <DialogFooter className="review-footer">
+            <Button variant="outline" onClick={() => downloadPayload('draft')}>
+              <Download />
+              Download a draft copy
+            </Button>
+            <Button onClick={() => setExitOpen(false)}>Keep working</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={reviewOpen} onOpenChange={setReviewOpen}>
         <DialogContent
           className="review-dialog"
-          showCloseButton={!studySubmitted}
+          showCloseButton={!studySubmitted || responsesDownloaded}
         >
           {studySubmitted ? (
             <div className="submitted-state">
               <div className="success-mark">
                 <Check />
               </div>
-              <p className="eyebrow">Submission received</p>
-              <DialogTitle>Thank you for completing the study.</DialogTitle>
+              <p className="eyebrow">One step left</p>
+              <DialogTitle>Download your responses.</DialogTitle>
               <DialogDescription>
-                Your structured annotations are saved locally for this first
-                version. You may now close this page.
+                Nothing was uploaded. Download the file below and send it to the
+                research team — it is the only copy of your work, so please do
+                this before closing the page.
               </DialogDescription>
-              <Button variant="outline" onClick={exportJson}>
+              <Button onClick={() => downloadPayload('final')}>
                 <Download />
-                Download submitted JSON
+                {responsesDownloaded
+                  ? 'Download responses again'
+                  : 'Download my responses'}
               </Button>
+              <p
+                className={
+                  responsesDownloaded ? 'submitted-note done' : 'submitted-note'
+                }
+              >
+                {responsesDownloaded
+                  ? `Saved as videoqa-verification-${fileSafeId(
+                      participantId,
+                    )}-${new Date().toISOString().slice(0, 10)}.json. You may now close this page.`
+                  : 'Your responses have not been downloaded yet.'}
+              </p>
             </div>
           ) : (
             <>
@@ -1500,7 +2076,8 @@ export default function VerificationStudy() {
                 <DialogTitle>Review your study before submission</DialogTitle>
                 <DialogDescription>
                   Confirm every required judgment is complete. You can return to
-                  any question and revise it.
+                  any question and revise it. When you submit, you will download
+                  your responses as a single file to send to the research team.
                 </DialogDescription>
               </DialogHeader>
               <div className="review-stats">
@@ -1556,9 +2133,12 @@ export default function VerificationStudy() {
                 </span>
               </label>
               <DialogFooter className="review-footer">
-                <Button variant="outline" onClick={exportJson}>
+                <Button
+                  variant="outline"
+                  onClick={() => downloadPayload('draft')}
+                >
                   <Download />
-                  Export draft JSON
+                  Download draft copy
                 </Button>
                 <Button
                   onClick={finalSubmit}

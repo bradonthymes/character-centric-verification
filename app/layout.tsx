@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   metadataBase: new URL(
     process.env.NEXT_PUBLIC_SITE_URL ??
-      'https://videoqa-dataset-verification.bmt-wcpa.chatgpt.site',
+      'https://bradonthymes.github.io/character-centric-verification/',
   ),
   title: 'VideoQA Dataset Verification',
   description:
