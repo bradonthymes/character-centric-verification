@@ -1,0 +1,96 @@
+{
+  "profile": "480p / 24 fps / crf 32",
+  "note": "Participants attach a folder holding these files; the app matches on filename only.",
+  "films": {
+    "american-fiction-2023": {
+      "title": "American Fiction",
+      "file": "american-fiction-2023.mp4",
+      "bytes": 221417449,
+      "durationSeconds": 7019.459
+    },
+    "challengers-2024": {
+      "title": "Challengers",
+      "file": "challengers-2024.mp4",
+      "bytes": 251264661,
+      "durationSeconds": 7898.349
+    },
+    "fair-play-2023": {
+      "title": "Fair Play",
+      "file": "fair-play-2023.mp4",
+      "bytes": 199928346,
+      "durationSeconds": 6916.625
+    },
+    "poker-face-101-dead-mans-hand-2023": {
+      "title": "Poker Face \u2014 S01E01",
+      "file": "poker-face-101-dead-mans-hand-2023.mp4",
+      "bytes": 117495980,
+      "durationSeconds": 4026.375
+    },
+    "deadpool-and-wolverine-2024": {
+      "title": "Deadpool & Wolverine",
+      "file": "deadpool-and-wolverine-2024.mp4",
+      "bytes": 290134609,
+      "durationSeconds": 7667.209
+    },
+    "wicked-2024": {
+      "title": "Wicked",
+      "file": "wicked-2024.mp4",
+      "bytes": 472801981,
+      "durationSeconds": 9702.464
+    },
+    "gladiator-ii-2024": {
+      "title": "Gladiator II",
+      "file": "gladiator-ii-2024.mp4",
+      "bytes": 434073906,
+      "durationSeconds": 9102.177
+    },
+    "anora-2024": {
+      "title": "Anora",
+      "file": "anora-2024.mp4",
+      "bytes": 311564953,
+      "durationSeconds": 8337.344
+    },
+    "a-real-pain-2024": {
+      "title": "A Real Pain",
+      "file": "a-real-pain-2024.mp4",
+      "bytes": 196806473,
+      "durationSeconds": 5387.459
+    },
+    "blink-twice-2024": {
+      "title": "Blink Twice",
+      "file": "blink-twice-2024.mp4",
+      "bytes": 228953667,
+      "durationSeconds": 6157.28
+    },
+    "bugonia-2025": {
+      "title": "Bugonia",
+      "file": "bugonia-2025.mp4",
+      "bytes": 197411923,
+      "durationSeconds": 7094.176
+    },
+    "knock-at-the-cabin-2023": {
+      "title": "Knock at the Cabin",
+      "file": "knock-at-the-cabin-2023.mp4",
+      "bytes": 176353377,
+      "durationSeconds": 6006.059
+    },
+    "marty-supreme-2025": {
+      "title": "Marty Supreme",
+      "file": "marty-supreme-2025.mp4",
+      "bytes": 344761669,
+      "durationSeconds": 8980.864
+    },
+    "the-holdovers-2023": {
+      "title": "The Holdovers",
+      "file": "the-holdovers-2023.mp4",
+      "bytes": 172087393,
+      "durationSeconds": 7981.033
+    },
+    "the-long-walk-2025": {
+      "title": "The Long Walk",
+      "file": "the-long-walk-2025.mp4",
+      "bytes": 349267722,
+      "durationSeconds": 6484.603
+    }
+  }
+}

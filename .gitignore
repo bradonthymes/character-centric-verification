@@ -36,3 +36,14 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# Media kept out of the published site: the study reads films from a folder
+# on the participant machine (see app/data/README.md).
+/media-archive/
+
+# Python bytecode from the build scripts
+__pycache__/
+
+# The full build corpus stays out of the repository; dataset.jsonl (the
+# released subset) is enough to validate the study set.
+claims.jsonl
