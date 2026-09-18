@@ -1,0 +1,65 @@
+name: Deploy study to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One in-flight deploy at a time; let a newer push finish rather than cancelling
+# a deployment midway.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Check the study data still matches the corpus
+        run: python3 scripts/select_study_items.py --check
+
+      - run: npm run lint
+
+      - name: Build the static export
+        env:
+          # A project site is served from /<repo>, so assets carry that prefix.
+          # Clear this if the site moves to a custom domain.
+          NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+        run: npm run build
+
+      - name: Shape and verify the Pages artifact
+        # vinext nests the prefixed assets one level too deep for a project
+        # site; this flattens them and fails if any reference breaks.
+        run: |
+          python3 scripts/prepare_pages_artifact.py \
+            dist/client /${{ github.event.repository.name }}
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/client
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
