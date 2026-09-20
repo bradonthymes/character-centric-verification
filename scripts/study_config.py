@@ -127,15 +127,21 @@ EXISTING_POSTERS = {
     'poker-face-101-dead-mans-hand-2023': 'poker_face_s01e01/poster.jpg',
 }
 
-# Question-type chips shown to reviewers. Codes missing from this table render
-# as the bare code (for example "N1") until the taxonomy names are filled in.
+# Question-type chips shown to reviewers, from the study's taxonomy. Four of
+# these (Q3, Q4, Q7, Q8) replace looser wordings carried over from the first
+# 12-question build. A code missing here would render as the bare code.
 Q_TYPE_LABELS = {
+    'Q1': 'Knowledge split',
     'Q2': 'Realization',
-    'Q3': 'Belief state',
-    'Q4': 'Source attribution',
-    'Q7': 'Deception detection',
-    'Q8': 'Temporal ordering',
-    # TODO: labels needed for N1, N2, N3, Q1, Q5, Q6.
+    'Q3': 'False belief',
+    'Q4': 'Knowledge source',
+    'Q5': 'First-order belief',
+    'Q6': 'Second-order belief',
+    'Q7': 'Accepting a claim',
+    'Q8': 'Order of discovery',
+    'N1': 'Epistemic arc',
+    'N2': 'Trust evolution',
+    'N3': 'Causal chain',
 }
 
 

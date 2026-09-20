@@ -6,8 +6,8 @@ on example_id for two things only: the anchor timestamps needed to cut clips
 (dataset.jsonl carries the scene id but no times) and the quality flags used to
 rank candidates.
 
-Selection runs per film independently and deterministically, so films can be
-added later without disturbing the ones already chosen.
+Selection is deterministic and balances question types across the complete
+study while retaining exactly ten questions per film.
 
     python3 scripts/select_study_items.py          # regenerate
     python3 scripts/select_study_items.py --check   # validate what is on disk
@@ -20,7 +20,7 @@ import hashlib
 import json
 import subprocess
 import sys
-from collections import Counter
+from collections import Counter, deque
 
 from study_config import (
     CLAIMS,
@@ -36,6 +36,7 @@ from study_config import (
 )
 
 MAX_TIER = 4
+Q_TYPES = ('N1', 'N2', 'N3', 'Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'Q7', 'Q8')
 
 
 def load_jsonl(path):
@@ -72,36 +73,146 @@ def probe_duration(path) -> float | None:
         return None
 
 
-def select_for_film(film_id, released, sources):
-    """Pick QUESTIONS_PER_FILM records, best tier first, spreading q_type then holder."""
-    pool = []
+def eligible_pool(released, sources):
+    """Return eligible candidates grouped by film and question type."""
+    pool = {(film_id, q_type): [] for film_id in FILMS for q_type in Q_TYPES}
     for record in released:
-        if record['film_id'] != film_id:
+        film_id = record['film_id']
+        if film_id not in FILMS or record['q_type'] not in Q_TYPES:
             continue
         source = sources[record['example_id']]
         tier = tier_of(record, source)
         if tier <= MAX_TIER:
-            pool.append((tier, record, source))
+            pool[(film_id, record['q_type'])].append((tier, record, source))
+    return pool
 
-    picked = []
-    used_type: Counter = Counter()
-    used_holder: Counter = Counter()
-    for tier in range(1, MAX_TIER + 1):
-        candidates = [entry for entry in pool if entry[0] == tier]
-        while candidates and len(picked) < QUESTIONS_PER_FILM:
-            candidates.sort(key=lambda entry: (
-                used_type[entry[1]['q_type']],
-                used_holder[entry[1]['holder']],
-                -entry[2]['n_core'],
-                entry[1]['example_id'],
+
+def balanced_type_targets(pool):
+    """Assign every type either floor(150/11) or ceil(150/11) questions."""
+    total = len(FILMS) * QUESTIONS_PER_FILM
+    base, extras = divmod(total, len(Q_TYPES))
+    available = {
+        q_type: sum(len(pool[(film_id, q_type)]) for film_id in FILMS)
+        for q_type in Q_TYPES
+    }
+    short = {q_type: count for q_type, count in available.items() if count < base}
+    if short:
+        details = ', '.join(f'{q_type}={count}' for q_type, count in short.items())
+        raise ValueError(f'cannot balance question types; fewer than {base} eligible: {details}')
+
+    # Give the remainder to the types with the largest eligible pools. This
+    # keeps the 13/14 split exact without forcing an extra low-tier rare item.
+    extra_types = sorted(Q_TYPES, key=lambda q: (-available[q], q))[:extras]
+    return {q_type: base + (q_type in extra_types) for q_type in Q_TYPES}
+
+
+def balanced_type_counts(pool, targets):
+    """Min-cost flow allocation for ten questions/film and exact type targets.
+
+    A repeat within a film costs slightly more than one tier step; core-claim
+    count breaks ties after that quality/diversity tradeoff.
+    """
+    graph = []
+
+    def node():
+        graph.append([])
+        return len(graph) - 1
+
+    def edge(start, end, capacity, cost):
+        forward = [end, len(graph[end]), capacity, cost]
+        reverse = [start, len(graph[start]), 0, -cost]
+        graph[start].append(forward)
+        graph[end].append(reverse)
+        return forward
+
+    source = node()
+    film_nodes = {film_id: node() for film_id in FILMS}
+    type_nodes = {q_type: node() for q_type in Q_TYPES}
+    sink = node()
+    slot_edges = {}
+
+    for film_id, film_node in film_nodes.items():
+        edge(source, film_node, QUESTIONS_PER_FILM, 0)
+        for q_type in Q_TYPES:
+            candidates = sorted(pool[(film_id, q_type)], key=lambda item: (
+                item[0], -item[2]['n_core'], item[1]['example_id'],
             ))
-            tier_value, record, source = candidates.pop(0)
-            picked.append((tier_value, record, source))
-            used_type[record['q_type']] += 1
-            used_holder[record['holder']] += 1
-        if len(picked) >= QUESTIONS_PER_FILM:
-            break
-    return picked
+            slot_edges[(film_id, q_type)] = []
+            for index, (tier, _record, candidate_source) in enumerate(candidates):
+                # A repeated type costs slightly more than one tier step. This
+                # favors per-film variety when the quality tradeoff is small,
+                # without replacing a strong item with a tier-4 item merely to
+                # avoid a repeat.
+                cost = ((tier - 1) * 1_000_000
+                        + index * 1_100_000
+                        + max(0, 20 - candidate_source['n_core']))
+                slot_edges[(film_id, q_type)].append(
+                    edge(film_node, type_nodes[q_type], 1, cost),
+                )
+    for q_type, type_node in type_nodes.items():
+        edge(type_node, sink, targets[q_type], 0)
+
+    required = sum(targets.values())
+    flow = 0
+    while flow < required:
+        distance = [None] * len(graph)
+        previous = [None] * len(graph)
+        distance[source] = 0
+        queue = deque([source])
+        queued = {source}
+        while queue:
+            current = queue.popleft()
+            queued.discard(current)
+            for edge_index, candidate in enumerate(graph[current]):
+                destination, _reverse, capacity, cost = candidate
+                if not capacity:
+                    continue
+                proposed = distance[current] + cost
+                if distance[destination] is None or proposed < distance[destination]:
+                    distance[destination] = proposed
+                    previous[destination] = (current, edge_index)
+                    if destination not in queued:
+                        queue.append(destination)
+                        queued.add(destination)
+        if distance[sink] is None:
+            raise ValueError('cannot satisfy per-film and question-type quotas')
+
+        current = sink
+        while current != source:
+            prior, edge_index = previous[current]
+            selected = graph[prior][edge_index]
+            selected[2] -= 1
+            graph[current][selected[1]][2] += 1
+            current = prior
+        flow += 1
+
+    return {
+        key: sum(candidate[2] == 0 for candidate in candidates)
+        for key, candidates in slot_edges.items()
+    }
+
+
+def select_balanced(released, sources):
+    """Select the globally balanced study set, preserving holder diversity."""
+    pool = eligible_pool(released, sources)
+    targets = balanced_type_targets(pool)
+    counts = balanced_type_counts(pool, targets)
+    picked = {film_id: [] for film_id in FILMS}
+    for film_id in FILMS:
+        used_holder: Counter = Counter()
+        for q_type in Q_TYPES:
+            candidates = list(pool[(film_id, q_type)])
+            for _ in range(counts[(film_id, q_type)]):
+                candidates.sort(key=lambda item: (
+                    item[0], used_holder[item[1]['holder']],
+                    -item[2]['n_core'], item[1]['example_id'],
+                ))
+                choice = candidates.pop(0)
+                picked[film_id].append(choice)
+                used_holder[choice[1]['holder']] += 1
+        picked[film_id].sort(key=lambda item: (Q_TYPES.index(item[1]['q_type']),
+                                               item[1]['example_id']))
+    return picked, targets
 
 
 def build():
@@ -116,6 +227,12 @@ def build():
         )
     released = load_jsonl(DATASET)
     sources = {record['example_id']: record for record in load_jsonl(CLAIMS)}
+    selected, _targets = select_balanced(released, sources)
+    existing_movies = {}
+    if QUESTIONS_JSON.exists():
+        existing_movies = {
+            movie['id']: movie for movie in json.loads(QUESTIONS_JSON.read_text())['movies']
+        }
 
     movies = []
     questions = []
@@ -123,9 +240,9 @@ def build():
     for film_id, (title, source_path) in FILMS.items():
         # Runtimes come from the source film, and the distribution encode keeps
         # them, so the app can check an attached file is the right copy.
-        runtime = probe_duration(source_path) or probe_duration(
-            DIST_DIR / f'{film_id}.mp4',
-        )
+        runtime = (probe_duration(source_path)
+                   or probe_duration(DIST_DIR / f'{film_id}.mp4')
+                   or existing_movies.get(film_id, {}).get('durationSeconds'))
         if runtime is None:
             print(f'  ! no runtime for {film_id}; falling back to last anchor', file=sys.stderr)
             runtime = max(
@@ -142,7 +259,7 @@ def build():
             'durationSeconds': runtime,
         })
 
-        picked = select_for_film(film_id, released, sources)
+        picked = selected[film_id]
         if len(picked) < QUESTIONS_PER_FILM:
             shortfalls.append((film_id, len(picked)))
         for tier, record, source in picked:
@@ -257,10 +374,21 @@ def check(payload=None):
     movies = {movie['id']: movie for movie in payload['movies']}
     errors = []
     per_film = Counter(q['movieId'] for q in payload['questions'])
+    per_type = Counter(q['qType'] for q in payload['questions'])
 
     for film_id in FILMS:
         if per_film[film_id] != QUESTIONS_PER_FILM:
             errors.append(f'{film_id}: {per_film[film_id]} questions, expected {QUESTIONS_PER_FILM}')
+
+    unknown_types = sorted(set(per_type) - set(Q_TYPES))
+    missing_types = sorted(set(Q_TYPES) - set(per_type))
+    if unknown_types:
+        errors.append(f'unknown question types: {", ".join(unknown_types)}')
+    if missing_types:
+        errors.append(f'missing question types: {", ".join(missing_types)}')
+    if per_type and max(per_type.values()) - min(per_type.values()) > 1:
+        distribution = ', '.join(f'{q_type}={per_type[q_type]}' for q_type in Q_TYPES)
+        errors.append(f'question types are not balanced: {distribution}')
 
     # Hashes: catches a hand-edited or truncated study-questions.json even with
     # no corpus to compare against.

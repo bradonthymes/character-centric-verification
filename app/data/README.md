@@ -29,10 +29,10 @@ with an explanation if they are absent.
 `select_study_items.py --check` adapts to what is present, so CI can verify the
 study set without the corpus:
 
-| Always | Structure (150 questions, 10 per film, no duplicates) and that every playback window covers its anchored scene |
-| --- | --- |
-| Always | The SHA-256 hashes in `study-integrity.json`, which catch a hand-edited or truncated `study-questions.json` |
-| With `dataset.jsonl` present | Re-compares every question, answer and claim word for word, and flags any id that is retired or unknown |
+| Always                       | Structure (150 questions, 10 per film, no duplicates) and that every playback window covers its anchored scene |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Always                       | The SHA-256 hashes in `study-integrity.json`, which catch a hand-edited or truncated `study-questions.json`    |
+| With `dataset.jsonl` present | Re-compares every question, answer and claim word for word, and flags any id that is retired or unknown        |
 
 `study-integrity.json` is written alongside the study set and records the hash of
 the corpus it was built from, so a `dataset.jsonl` that has moved on since is
@@ -49,14 +49,19 @@ reported rather than silently trusted.
 | 3    | scene ≤240 s, up to 6 claims, not `prose_stale`                      |
 | 4    | as tier 3, `prose_stale` allowed                                     |
 
-Within a tier, picks go round-robin to spread question types, then holders,
-breaking ties by core-claim count and then `example_id`. Selection runs **per
-film independently and deterministically**, so adding a film later leaves the
-others untouched. Each question records the tier it came in under as
+Selection balances the complete study globally: each of the 11 question types
+appears 13 or 14 times, while every film still contributes exactly 10 questions.
+The seven extra slots from `150 = 11 × 13 + 7` go to the types with the largest
+eligible pools, avoiding an unnecessary low-tier pick. A deterministic min-cost
+allocation jointly favors type diversity within each film and better tiers: one
+repeated type costs slightly more than one tier step, so variety wins when the
+quality tradeoff is modest but does not force a tier-4 item by itself. Core-claim
+count and holder diversity break later ties. Each question records its tier as
 `selectionTier`.
 
-The current set is 141 tier-1 and 9 tier-2 items (American Fiction 3,
-Challengers 2, Poker Face 4 — those three have the thinnest eligible pools).
+The current set is 100 tier-1, 28 tier-2, 13 tier-3, and 9 tier-4 items. All nine
+tier-4 selections represent the rarest types: after the quality filters, the 15
+films contain only 14 eligible Q5 and 13 eligible Q6 questions.
 
 ## Media
 
@@ -99,10 +104,22 @@ proxies from the earlier hosted design, in case that approach is ever revisited.
 ## Question-type chips
 
 `Q_TYPE_LABELS` in `scripts/study_config.py` maps the corpus `q_type` to the chip
-text. Filled in: Q2 Realization, Q3 Belief state, Q4 Source attribution,
-Q7 Deception detection, Q8 Temporal ordering. **Still needed: N1, N2, N3, Q1,
-Q5** — those render as the bare code until the taxonomy names are added and the
-selection script is re-run.
+text. All eleven types are named, so no question shows a bare code:
+
+| Code | Chip                |     | Code | Chip               |
+| ---- | ------------------- | --- | ---- | ------------------ |
+| Q1   | Knowledge split     |     | Q7   | Accepting a claim  |
+| Q2   | Realization         |     | Q8   | Order of discovery |
+| Q3   | False belief        |     | N1   | Epistemic arc      |
+| Q4   | Knowledge source    |     | N2   | Trust evolution    |
+| Q5   | First-order belief  |     | N3   | Causal chain       |
+| Q6   | Second-order belief |     |      |                    |
+
+Q3, Q4, Q7 and Q8 previously carried looser wordings ("Belief state", "Source
+attribution", "Deception detection", "Temporal ordering") inherited from the
+first 12-question build; the table above is the study's own taxonomy and
+replaces them. Labels affect only the chip — selection keys off `q_type`, so
+renaming one never changes which questions are chosen.
 
 The type code embedded in an `example_id` is **not** always the record's current
 type: the script gate rewrote some questions and re-typed them, keeping the

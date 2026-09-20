@@ -2,7 +2,7 @@
   "note": "Written by select_study_items.py. --check verifies these; with dataset.jsonl present it also re-compares every question.",
   "dataset_sha256": "5deb32f3854ffa8217addfb7d6928d8178c8678f7f67b77f7224a3b49c67a733",
   "dataset_records": 6327,
-  "questions_sha256": "10af200742e0de5f012ac67fd4b1abb4c3323109c71edf49672fd1851c19e70b",
+  "questions_sha256": "b2e2c0d5159263c71e71b5a89134afa79133c534a0bd2cfb01df8060ec4733e8",
   "movies_sha256": "c563e8dfe8459bc280981bbbe4b98e93cb64997687bd1d95f15d1e984739f0e8",
   "question_count": 150
 }
