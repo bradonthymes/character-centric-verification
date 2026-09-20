@@ -53,6 +53,8 @@ import {
 import {
   movieById,
   movies,
+  studyIntegrity,
+  studySource,
   studyQuestions,
   type StudyQuestion,
 } from './data/study-data';
@@ -140,6 +142,8 @@ declare global {
 const STORAGE_KEY = 'videoqa-verification-v1';
 const PARTICIPANT_KEY = 'videoqa-verification-participant-v1';
 const FINAL_SUBMISSION_KEY = 'videoqa-study-final-submission';
+const POSITION_KEY = 'videoqa-verification-position-v1';
+const EXPORT_SCHEMA_VERSION = 2;
 
 // Poster paths in the data are root-absolute. Next rewrites its own asset URLs
 // for a GitHub Pages project site, but not strings we hand to <img>.
@@ -539,6 +543,7 @@ export default function VerificationStudy() {
   const [finalConfirmed, setFinalConfirmed] = useState(false);
   const [studySubmitted, setStudySubmitted] = useState(false);
   const [responsesDownloaded, setResponsesDownloaded] = useState(false);
+  const [finalPayloadJson, setFinalPayloadJson] = useState('');
   const [participantId, setParticipantId] = useState('');
   const [assignedId, setAssignedId] = useState('');
   const [pendingSeek, setPendingSeek] = useState<number | null>(null);
@@ -555,6 +560,29 @@ export default function VerificationStudy() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const currentIndexRef = useRef(currentIndex);
   const annotationsRef = useRef(annotations);
+  const questionOpenedAtRef = useRef(Date.now());
+
+  const accrueCurrentQuestionTime = useCallback(() => {
+    const now = Date.now();
+    const elapsedSeconds = Math.max(
+      0,
+      Math.round((now - questionOpenedAtRef.current) / 1000),
+    );
+    questionOpenedAtRef.current = now;
+    const activeQuestion = studyQuestions[currentIndexRef.current];
+    const current = annotationsRef.current[activeQuestion.id];
+    if (!current?.started_at || elapsedSeconds === 0)
+      return annotationsRef.current;
+    const updated: AnnotationMap = {
+      ...annotationsRef.current,
+      [activeQuestion.id]: {
+        ...current,
+        time_spent_seconds: current.time_spent_seconds + elapsedSeconds,
+      },
+    };
+    annotationsRef.current = updated;
+    return updated;
+  }, []);
 
   const question = studyQuestions[currentIndex];
   const movie = movieById[question.movieId];
@@ -571,16 +599,31 @@ export default function VerificationStudy() {
       if (storedParticipant) setParticipantId(storedParticipant);
       else setAssignedId(makeParticipantId());
       const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) setAnnotations(normalizeAnnotations(JSON.parse(stored)));
+      if (stored) {
+        const restored = normalizeAnnotations(JSON.parse(stored));
+        annotationsRef.current = restored;
+        setAnnotations(restored);
+      }
+      const storedQuestionId = localStorage.getItem(POSITION_KEY);
+      const storedIndex = studyQuestions.findIndex(
+        (item) => item.id === storedQuestionId,
+      );
+      if (storedIndex >= 0) {
+        currentIndexRef.current = storedIndex;
+        setCurrentIndex(storedIndex);
+      }
       // A reviewer who closed the page before downloading comes back to the
       // download step rather than to a finished study with no file.
-      if (localStorage.getItem(FINAL_SUBMISSION_KEY)) {
+      const storedFinalPayload = localStorage.getItem(FINAL_SUBMISSION_KEY);
+      if (storedFinalPayload) {
+        setFinalPayloadJson(storedFinalPayload);
         setStudySubmitted(true);
         setReviewOpen(true);
       }
     } catch {
       setSaveLabel('Local draft could not be restored');
     }
+    questionOpenedAtRef.current = Date.now();
     setMounted(true);
   }, []);
 
@@ -658,6 +701,7 @@ export default function VerificationStudy() {
     const id = assignedId || makeParticipantId();
     setParticipantId(id);
     writeStorage(PARTICIPANT_KEY, id);
+    questionOpenedAtRef.current = Date.now();
   }, [assignedId]);
 
   useEffect(() => {
@@ -681,34 +725,48 @@ export default function VerificationStudy() {
   }, [annotations, dirty, mounted]);
 
   useEffect(() => {
+    const persistNow = () => {
+      const timedAnnotations = accrueCurrentQuestionTime();
+      return writeStorage(STORAGE_KEY, JSON.stringify(timedAnnotations));
+    };
     const warn = (event: BeforeUnloadEvent) => {
-      if (dirty) {
+      if (dirty && !persistNow()) {
         event.preventDefault();
         event.returnValue = '';
       }
     };
+    const saveOnHide = () => {
+      if (dirty) persistNow();
+    };
     window.addEventListener('beforeunload', warn);
-    return () => window.removeEventListener('beforeunload', warn);
-  }, [dirty]);
+    window.addEventListener('pagehide', saveOnHide);
+    return () => {
+      window.removeEventListener('beforeunload', warn);
+      window.removeEventListener('pagehide', saveOnHide);
+    };
+  }, [accrueCurrentQuestionTime, dirty]);
 
   const updateAnnotation = useCallback(
     (questionId: string, updater: (value: Annotation) => Annotation) => {
       setAnnotations((current) => {
         const next = updater(current[questionId]);
         const started = next.started_at || new Date().toISOString();
-        return {
+        const status: Annotation['status'] =
+          next.status === 'complete'
+            ? 'complete'
+            : touched({ ...next, started_at: started })
+              ? 'in_progress'
+              : 'not_started';
+        const updated: AnnotationMap = {
           ...current,
           [questionId]: {
             ...next,
             started_at: started,
-            status:
-              next.status === 'complete'
-                ? 'complete'
-                : touched({ ...next, started_at: started })
-                  ? 'in_progress'
-                  : 'not_started',
+            status,
           },
         };
+        annotationsRef.current = updated;
+        return updated;
       });
       setDirty(true);
       setErrors([]);
@@ -758,22 +816,32 @@ export default function VerificationStudy() {
     updateQuestion('issues', [...new Set(next)]);
   };
 
-  const goToQuestion = useCallback((index: number) => {
-    setCurrentIndex(Math.max(0, Math.min(studyQuestions.length - 1, index)));
-    setActiveTab('question');
-    setVideoMode('evidence');
-    setPendingSeek(null);
-    setCurrentTime(0);
-    setTranscriptQuery('');
-    setErrors([]);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
+  const goToQuestion = useCallback(
+    (index: number) => {
+      const timedAnnotations = accrueCurrentQuestionTime();
+      setAnnotations(timedAnnotations);
+      writeStorage(STORAGE_KEY, JSON.stringify(timedAnnotations));
+      const nextIndex = Math.max(0, Math.min(studyQuestions.length - 1, index));
+      setCurrentIndex(nextIndex);
+      currentIndexRef.current = nextIndex;
+      writeStorage(POSITION_KEY, studyQuestions[nextIndex].id);
+      setActiveTab('question');
+      setVideoMode('evidence');
+      setPendingSeek(null);
+      setCurrentTime(0);
+      setTranscriptQuery('');
+      setErrors([]);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    },
+    [accrueCurrentQuestionTime],
+  );
 
   const submitCurrent = useCallback(
     (fromTool = false) => {
       const index = currentIndexRef.current;
       const currentQuestion = studyQuestions[index];
-      const currentAnnotation = annotationsRef.current[currentQuestion.id];
+      const timedAnnotations = accrueCurrentQuestionTime();
+      const currentAnnotation = timedAnnotations[currentQuestion.id];
       const found = validationErrors(currentAnnotation, currentQuestion);
       if (found.length) {
         setErrors(found);
@@ -794,7 +862,7 @@ export default function VerificationStudy() {
         completed_at: new Date().toISOString(),
       };
       const nextAnnotations = {
-        ...annotationsRef.current,
+        ...timedAnnotations,
         [currentQuestion.id]: completed,
       };
       annotationsRef.current = nextAnnotations;
@@ -815,7 +883,7 @@ export default function VerificationStudy() {
         status: 'complete',
       };
     },
-    [goToQuestion],
+    [accrueCurrentQuestionTime, goToQuestion],
   );
 
   useEffect(() => {
@@ -989,7 +1057,9 @@ export default function VerificationStudy() {
       [movieId]: !(current[movieId] ?? movieId === question.movieId),
     }));
   const forceSave = () => {
-    const stored = writeStorage(STORAGE_KEY, JSON.stringify(annotations));
+    const timedAnnotations = accrueCurrentQuestionTime();
+    setAnnotations(timedAnnotations);
+    const stored = writeStorage(STORAGE_KEY, JSON.stringify(timedAnnotations));
     setDirty(!stored);
     setSaveLabel(stored ? 'Draft saved just now' : 'Draft could not be saved');
     return stored;
@@ -1012,10 +1082,34 @@ export default function VerificationStudy() {
     }));
 
   const buildPayload = (kind: 'draft' | 'final') => ({
+    export_schema_version: EXPORT_SCHEMA_VERSION,
     participant_id: participantId,
     study: 'videoqa-dataset-verification',
     export_kind: kind,
     exported_at: new Date().toISOString(),
+    question_set: {
+      dataset: studySource.dataset,
+      released_records: studySource.released_records,
+      dataset_sha256: studyIntegrity.dataset_sha256,
+      questions_sha256: studyIntegrity.questions_sha256,
+      question_count: studyQuestions.length,
+      q_type_counts: Object.fromEntries(
+        [...new Set(studyQuestions.map((item) => item.qType))]
+          .sort()
+          .map((qType) => [
+            qType,
+            studyQuestions.filter((item) => item.qType === qType).length,
+          ]),
+      ),
+      selection_tier_counts: Object.fromEntries(
+        [...new Set(studyQuestions.map((item) => item.selectionTier))]
+          .sort((left, right) => left - right)
+          .map((tier) => [
+            String(tier),
+            studyQuestions.filter((item) => item.selectionTier === tier).length,
+          ]),
+      ),
+    },
     questions_total: studyQuestions.length,
     questions_complete: completedCount,
     unanswered_required_fields: unansweredCount,
@@ -1037,15 +1131,32 @@ export default function VerificationStudy() {
       ),
     },
     annotations: studyQuestions.map((item) => ({
-      ...annotations[item.id],
+      ...annotationsRef.current[item.id],
       participant_id: participantId,
+      movie_id: item.movieId,
+      question_id: item.id,
+      q_type: item.qType,
+      question_category: item.category,
+      selection_tier: item.selectionTier,
+      holder: item.holder,
+      anchor_scene_id: item.anchor.sceneId,
+      anchor_start_seconds: item.anchor.start,
+      anchor_end_seconds: item.anchor.end,
     })),
   });
 
   // The downloaded file is the only copy the research team receives, so the
   // anchor is attached to the document and the blob URL outlives the click.
   const downloadPayload = (kind: 'draft' | 'final') => {
-    const blob = new Blob([JSON.stringify(buildPayload(kind), null, 2)], {
+    let payload = JSON.stringify(buildPayload(kind), null, 2);
+    if (kind === 'final' && finalPayloadJson) {
+      try {
+        payload = JSON.stringify(JSON.parse(finalPayloadJson), null, 2);
+      } catch {
+        // Fall back to the current in-memory state if stored JSON is corrupt.
+      }
+    }
+    const blob = new Blob([payload], {
       type: 'application/json',
     });
     const url = URL.createObjectURL(blob);
@@ -1064,7 +1175,13 @@ export default function VerificationStudy() {
 
   const finalSubmit = () => {
     if (!finalConfirmed || unansweredCount > 0) return;
-    writeStorage(FINAL_SUBMISSION_KEY, JSON.stringify(buildPayload('final')));
+    if (!forceSave()) return;
+    const payload = JSON.stringify(buildPayload('final'));
+    if (!writeStorage(FINAL_SUBMISSION_KEY, payload)) {
+      setSaveLabel('Final submission could not be saved');
+      return;
+    }
+    setFinalPayloadJson(payload);
     setStudySubmitted(true);
   };
 

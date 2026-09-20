@@ -128,3 +128,12 @@ carrying an explicit `revision.revised_type`, and 17 of the 150 selected
 questions. The `q_type` field is authoritative and is what the chip shows, while
 `id` keeps the original `example_id` because that is the join key back to the
 corpus — so an id may read `…_N1_…` for a question the interface labels Q5.
+
+## Response exports
+
+Draft and final response JSON use `export_schema_version: 2`. Every annotation
+repeats the analysis fields needed without a separate join: `q_type`,
+`question_category`, `selection_tier`, `holder`, and the anchor scene and times.
+The top-level `question_set` records the dataset and question-set SHA-256 hashes
+plus counts by question type and selection tier. Final downloads use the exact
+payload captured when the participant submitted, including after a reload.

@@ -1,4 +1,5 @@
 import studyQuestionsJson from './study-questions.json';
+import studyIntegrityJson from './study-integrity.json';
 
 export type Movie = {
   id: string;
@@ -37,10 +38,18 @@ type StudyData = {
   questions: StudyQuestion[];
 };
 
+type StudyIntegrity = {
+  dataset_sha256: string;
+  questions_sha256: string;
+  question_count: number;
+};
+
 // scripts/select_study_items.py writes this file from dataset.jsonl. The cast
 // widens the JSON's literal types (role, for one) to the study types.
 const studyData = studyQuestionsJson as unknown as StudyData;
 
+export const studySource: Record<string, string | number> = studyData.source;
+export const studyIntegrity = studyIntegrityJson as StudyIntegrity;
 export const movies: Movie[] = studyData.movies;
 export const studyQuestions: StudyQuestion[] = studyData.questions;
 

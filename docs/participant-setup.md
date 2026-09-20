@@ -61,7 +61,8 @@ claims behind it.
   when you need more context to judge a claim.
 
 Expect this to take several sittings. Your work is saved in your browser as you
-go, so you can close the page and come back to it.
+go, so you can close the page and come back to it. The study reopens on the last
+question you visited, with your entered judgments and comments restored.
 
 Two things to know about that:
 
