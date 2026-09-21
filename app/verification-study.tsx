@@ -1775,7 +1775,7 @@ export default function VerificationStudy() {
                 />
                 <RadioQuestion
                   label="B · Relevance"
-                  prompt="Does the answer directly address the question?"
+                  prompt="Is the reference answer relevant to what the question asks?"
                   value={annotation.answer_verification.relevance}
                   onChange={(value) => updateAnswer('relevance', value)}
                   options={[
@@ -1786,7 +1786,7 @@ export default function VerificationStudy() {
                 />
                 <RadioQuestion
                   label="C · Completeness"
-                  prompt="Does the answer include the information needed to answer the question?"
+                  prompt="Does the reference answer address all parts of the question?"
                   value={annotation.answer_verification.completeness}
                   onChange={(value) => updateAnswer('completeness', value)}
                   options={[
